@@ -1,0 +1,870 @@
+#!/usr/bin/env bash
+# canva-affinity: connect Affinity by Canva (running under Wine) to your Canva
+# account on Linux, so the Canva AI tools that come with your Canva plan unlock.
+#
+# Signing in to Canva from Affinity opens your browser. When you finish, Canva
+# sends an affinity:// link back to the app. Under Wine that link usually never
+# arrives, so Affinity stays signed out. This tool fixes the pieces involved:
+#
+#   1. A Linux handler for affinity:// links that starts Affinity.exe with the
+#      link as its argument. A running Affinity receives it from that second
+#      instance over a named pipe. Wine's own handler uses `wine start`, which
+#      crashes on links this long (the callback is ~1700 characters).
+#   2. The .NET WinRT facades (System.Runtime.WindowsRuntime*.dll) that
+#      `winetricks dotnet48` leaves out. Without them Affinity cannot compile the
+#      code that reads the link, and the running app crashes when it arrives.
+#   3. Windows metadata (.winmd) for Wine builds that need it.
+#
+# Run `canva-affinity help` for usage.
+
+set -o errexit -o nounset -o pipefail
+shopt -s nullglob
+
+readonly VERSION="1.0.0"
+readonly APP_ID="canva-affinity-connector"
+readonly HANDLER_DESKTOP="canva-affinity-handler.desktop"
+readonly SCHEME="affinity"
+readonly MIME="x-scheme-handler/${SCHEME}"
+# Handlers we may replace without --force: none, ours, and Wine's generated one.
+readonly WINE_GENERATED_HANDLER="wine-protocol-affinity.desktop"
+
+# .NET Framework 4.8 offline installer (the same file winetricks dotnet48 uses).
+readonly NDP48_NAME="ndp48-x86-x64-allos-enu.exe"
+readonly NDP48_URL="https://download.visualstudio.microsoft.com/download/pr/7afca223-55d2-470a-8edc-6a1739ae3252/abd170b4b0ec15ad0222a809b761a036/${NDP48_NAME}"
+readonly NDP48_SHA256="95889d6de3f2070c07790ad6cf2000d33d9a1bdfc6a381725ab82ab1c314fd53"
+# Windows 10 servicing package inside it that carries the WinRT facades.
+readonly NDP48_CAB="x64-Windows10.0-KB4486153-x64.cab"
+readonly FACADE_TOKEN="b77a5c561934e089"
+readonly FACADE_GAC_VERSION="v4.0_4.0.0.0__${FACADE_TOKEN}"
+readonly -a FACADES=("System.Runtime.WindowsRuntime" "System.Runtime.WindowsRuntime.UI.Xaml")
+readonly -A FACADE_SHA256=(
+    ["System.Runtime.WindowsRuntime"]="1e1e6b4ac4e758fe1066e315f7928c393e1216dbe55c318803dd107123e1a8e3"
+    ["System.Runtime.WindowsRuntime.UI.Xaml"]="8e035a8667213e5a87b69757251a00c7c5f72c5b1b8f7578ec20688629b189e1"
+)
+
+# Windows metadata archive used by the Affinity-on-Linux community installers.
+readonly WINMD_URL="https://github.com/ryzendew/AffinityOnLinux/releases/download/10.4-Wine-Affinity/WinMetadata.tar.xz"
+readonly WINMD_SHA256="52d9d646d37425483367af90038a8bf88eb763576b53ef9ebc126483873eabfb"
+# Per-namespace metadata that some Wine 11 builds need for the sign-in callback.
+readonly -a LOGIN_WINMD=(
+    "windows.applicationmodel.datatransfer.winmd"
+    "windows.foundation.winmd"
+    "windows.storage.streams.winmd"
+)
+
+# Common places Affinity Wine prefixes live (first match wins).
+readonly -a PREFIX_CANDIDATES=(
+    "$HOME/.AffinityLinux"                  # Linux-Affinity-Installer
+    "$HOME/.affinity"                       # AffinityOnLinux guides
+    "$HOME/.affinity-appimage-wineprefix"   # Affinity AppImage
+    "$HOME/.local/share/wineprefixes/affinity"
+    "$HOME/Games/affinity"                  # Lutris default
+    "$HOME/.wine"
+)
+
+readonly CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/${APP_ID}"
+readonly CONFIG_FILE="${CONFIG_DIR}/config"
+readonly STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/${APP_ID}"
+readonly LOG_FILE="${STATE_DIR}/handler.log"
+readonly APPS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+readonly MIMEAPPS="${XDG_CONFIG_HOME:-$HOME/.config}/mimeapps.list"
+
+# Options (set from flags, config file, then auto-detection).
+OPT_PREFIX=""
+OPT_WINE=""
+OPT_EXE=""
+OPT_DRY_RUN=0
+OPT_FORCE=0
+OPT_YES=0
+OPT_SKIP_FACADES=0
+OPT_SKIP_WINMD=0
+OPT_SKIP_REGISTRY=0
+OPT_FOREGROUND=0
+OPT_PURGE=0
+HANDLE_MODE=0
+
+PREFIX=""
+WINE=""
+EXE=""
+WINE_ENV=""
+
+# ---------------------------------------------------------------- output ----
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    C_RED=$'\e[31m' C_GRN=$'\e[32m' C_YEL=$'\e[33m' C_BLU=$'\e[34m' C_DIM=$'\e[2m' C_OFF=$'\e[0m'
+else
+    C_RED="" C_GRN="" C_YEL="" C_BLU="" C_DIM="" C_OFF=""
+fi
+
+info() { printf '%s==>%s %s\n' "$C_BLU" "$C_OFF" "$*"; }
+ok()   { printf '%s ✓ %s %s\n' "$C_GRN" "$C_OFF" "$*"; }
+warn() { printf '%s ! %s %s\n' "$C_YEL" "$C_OFF" "$*" >&2; }
+bad()  { printf '%s ✗ %s %s\n' "$C_RED" "$C_OFF" "$*"; }
+hint() { printf '   %s%s%s\n' "$C_DIM" "$*" "$C_OFF"; }
+die() {
+    printf '%serror:%s %s\n' "$C_RED" "$C_OFF" "$*" >&2
+    # The browser shows none of our output, so leave a trace for handle errors.
+    if (( HANDLE_MODE )); then
+        mkdir -p "$STATE_DIR" 2>/dev/null && printf '%s error: %s\n' "$(date '+%F %T')" "$*" >> "$LOG_FILE" 2>/dev/null
+        have notify-send && notify-send -a "Affinity Canva sign-in" "Canva sign-in failed" "$1" 2>/dev/null
+    fi
+    exit 1
+}
+
+# Run a command, or only print it with --dry-run.
+run() {
+    if (( OPT_DRY_RUN )); then
+        printf '   %s[dry-run]%s %s\n' "$C_DIM" "$C_OFF" "$*"
+        return 0
+    fi
+    "$@"
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
+
+# ---------------------------------------------------------------- config ----
+
+# Read KEY=value lines from the config file. The file is parsed, never sourced.
+load_config() {
+    [[ -f "$CONFIG_FILE" ]] || return 0
+    local line key value
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+        [[ "$line" =~ ^([A-Z_]+)=(.*)$ ]] || continue
+        key=${BASH_REMATCH[1]}
+        value=${BASH_REMATCH[2]}
+        # Strip one level of matching surrounding quotes.
+        if [[ "$value" =~ ^\"(.*)\"$ || "$value" =~ ^\'(.*)\'$ ]]; then
+            value=${BASH_REMATCH[1]}
+        fi
+        case "$key" in
+            PREFIX)   [[ -n "$OPT_PREFIX" ]] || PREFIX=$value ;;
+            WINE)     [[ -n "$OPT_WINE" ]] || WINE=$value ;;
+            EXE)      [[ -n "$OPT_EXE" ]] || EXE=$value ;;
+            WINE_ENV) WINE_ENV=$value ;;
+        esac
+    done < "$CONFIG_FILE"
+}
+
+save_config() {
+    run mkdir -p "$CONFIG_DIR"
+    if (( OPT_DRY_RUN )); then
+        hint "[dry-run] would write $CONFIG_FILE"
+        return 0
+    fi
+    local tmp="${CONFIG_FILE}.tmp"
+    {
+        echo "# ${APP_ID} configuration. Written by 'canva-affinity setup'."
+        echo "# Edit freely; values are read as plain text, never run as code."
+        printf 'PREFIX="%s"\n' "$PREFIX"
+        printf 'WINE="%s"\n' "$WINE"
+        printf 'EXE="%s"\n' "$EXE"
+        echo "# Extra environment for Affinity, space separated, e.g."
+        echo "# WINE_ENV=\"WINEDLLOVERRIDES=d3d9=n,b DXVK_LOG_LEVEL=none\""
+        printf 'WINE_ENV="%s"\n' "$WINE_ENV"
+    } > "$tmp"
+    mv "$tmp" "$CONFIG_FILE"
+}
+
+# ------------------------------------------------------------- detection ----
+
+affinity_dir() { printf '%s/drive_c/Program Files/Affinity/Affinity' "$1"; }
+
+is_affinity_prefix() { [[ -f "$(affinity_dir "$1")/Affinity.exe" ]]; }
+
+detect_prefix() {
+    local p
+    if [[ -n "${WINEPREFIX:-}" ]] && is_affinity_prefix "$WINEPREFIX"; then
+        printf '%s' "$WINEPREFIX"; return 0
+    fi
+    for p in "${PREFIX_CANDIDATES[@]}"; do
+        if is_affinity_prefix "$p"; then printf '%s' "$p"; return 0; fi
+    done
+    # Bottles (native install) keeps each bottle in its own folder.
+    for p in "$HOME"/.local/share/bottles/bottles/*/; do
+        p=${p%/}
+        if is_affinity_prefix "$p"; then printf '%s' "$p"; return 0; fi
+    done
+    return 1
+}
+
+# Find the Wine that belongs to this prefix: the bundled ElementalWarrior build,
+# a Bottles runner, or the system Wine.
+detect_wine() {
+    local prefix=$1 candidate runner
+    for candidate in \
+        "$prefix/ElementalWarriorWine/bin/wine" \
+        "$prefix/wine/bin/wine"; do
+        if [[ -x "$candidate" ]]; then printf '%s' "$candidate"; return 0; fi
+    done
+    if [[ -f "$prefix/bottle.yml" ]]; then
+        runner=$(sed -n 's/^Runner:[[:space:]]*//p' "$prefix/bottle.yml" | head -n1 | tr -d "'\"")
+        candidate="$HOME/.local/share/bottles/runners/${runner}/bin/wine"
+        if [[ -n "$runner" && -x "$candidate" ]]; then printf '%s' "$candidate"; return 0; fi
+    fi
+    if have wine; then command -v wine; return 0; fi
+    return 1
+}
+
+# Prefer AffinityHook.exe (AffinityPluginLoader) so plugins such as WineFix and
+# LoginFix load on a cold start; otherwise the real Affinity.exe.
+detect_exe() {
+    local dir
+    dir=$(affinity_dir "$1")
+    if [[ -f "$dir/AffinityHook.exe" ]]; then
+        printf '%s' "$dir/AffinityHook.exe"
+    else
+        printf '%s' "$dir/Affinity.exe"
+    fi
+}
+
+# Fill PREFIX / WINE / EXE from flags, the config file and detection.
+resolve_targets() {
+    local need_wine=${1:-1}
+    [[ -n "$OPT_PREFIX" ]] && PREFIX=$OPT_PREFIX
+    [[ -n "$OPT_WINE" ]] && WINE=$OPT_WINE
+    [[ -n "$OPT_EXE" ]] && EXE=$OPT_EXE
+    load_config
+
+    if [[ -z "$PREFIX" ]]; then
+        PREFIX=$(detect_prefix) || die "No Affinity install found under Wine.
+       Looked in: \$WINEPREFIX, ${PREFIX_CANDIDATES[*]}, and Bottles.
+       Install Affinity first (see README), or pass --prefix /path/to/wineprefix."
+    fi
+    PREFIX=$(realpath -m -- "$PREFIX")
+    is_affinity_prefix "$PREFIX" || die "No Affinity.exe in $PREFIX
+       Expected: $(affinity_dir "$PREFIX")/Affinity.exe"
+
+    [[ -n "$EXE" ]] || EXE=$(detect_exe "$PREFIX")
+    [[ -f "$EXE" ]] || die "Affinity executable not found: $EXE"
+
+    if [[ -z "$WINE" ]]; then
+        WINE=$(detect_wine "$PREFIX") || true
+    fi
+    if (( need_wine )) && [[ -z "$WINE" || ! -x "$WINE" ]]; then
+        die "Wine not found for $PREFIX. Pass --wine /path/to/bin/wine."
+    fi
+}
+
+# "MAJOR MINOR" of the configured Wine, or nothing if it will not run.
+wine_version() {
+    [[ -n "$WINE" && -x "$WINE" ]] || return 1
+    local out
+    out=$(WINEPREFIX="$PREFIX" WINEDEBUG=-all "$WINE" --version 2>/dev/null) || return 1
+    [[ "$out" =~ wine-([0-9]+)\.([0-9]+) ]] || return 1
+    printf '%s %s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+}
+
+# True when this Wine implements RoResolveNamespace (reads WinMetadata) instead
+# of stubbing it. Detected by the directory name inside its wintypes.dll.
+wine_resolves_winrt() {
+    [[ -n "$WINE" ]] || return 1
+    local root dll
+    root=$(dirname "$(dirname "$(realpath -m -- "$WINE")")")
+    for dll in "$root"/lib/wine/x86_64-windows/wintypes.dll "$root"/lib64/wine/x86_64-windows/wintypes.dll; do
+        [[ -f "$dll" ]] || continue
+        if LC_ALL=C grep -qaP 'W\x00i\x00n\x00M\x00e\x00t\x00a\x00[Dd]\x00a\x00t\x00a\x00' "$dll"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+system32() { printf '%s/drive_c/windows/system32' "$PREFIX"; }
+
+# The prefix's WinMetadata folder, whichever case Wine created it in.
+winmd_dir() {
+    local d
+    for d in "$(system32)/winmetadata" "$(system32)/WinMetadata" "$(system32)/WinMetaData"; do
+        [[ -d "$d" ]] && { printf '%s' "$d"; return 0; }
+    done
+    printf '%s' "$(system32)/WinMetadata"
+}
+
+winmd_present() {
+    local d files
+    d=$(winmd_dir)
+    files=("$d"/*.winmd)
+    (( ${#files[@]} > 0 ))
+}
+
+login_winmd_present() {
+    local d name
+    d=$(winmd_dir)
+    for name in "${LOGIN_WINMD[@]}"; do
+        find "$d" -maxdepth 1 -iname "$name" 2>/dev/null | grep -q . || return 1
+    done
+}
+
+facade_path() {
+    printf '%s/drive_c/windows/Microsoft.NET/assembly/GAC_MSIL/%s/%s/%s.dll' \
+        "$PREFIX" "$1" "$FACADE_GAC_VERSION" "$1"
+}
+
+facades_installed() {
+    local name
+    for name in "${FACADES[@]}"; do
+        [[ -f "$(facade_path "$name")" ]] || return 1
+    done
+}
+
+dotnet48_installed() {
+    [[ -f "$PREFIX/drive_c/windows/Microsoft.NET/Framework64/v4.0.30319/clr.dll" ||
+       -f "$PREFIX/drive_c/windows/Microsoft.NET/Framework/v4.0.30319/clr.dll" ]]
+}
+
+# Can this Wine complete the sign-in callback? Prints supported, unsupported
+# or unknown, and a short reason on the second line.
+signin_support() {
+    local ver major
+    if ! ver=$(wine_version); then
+        printf 'unknown\nWine at %s does not run' "${WINE:-?}"; return
+    fi
+    major=${ver%% *}
+    if (( major == 9 || major == 10 )); then
+        printf 'supported\nWine %s' "${ver/ /.}"; return
+    fi
+    if (( major >= 11 )); then
+        if wine_resolves_winrt; then
+            printf 'supported\nWine %s reads WinMetadata' "${ver/ /.}"; return
+        fi
+        if login_winmd_present; then
+            printf 'supported\nWine %s with login metadata' "${ver/ /.}"; return
+        fi
+        printf 'unsupported\nWine %s stubs WinRT metadata and has no login metadata' "${ver/ /.}"; return
+    fi
+    printf 'unsupported\nWine %s is too old' "${ver/ /.}"
+}
+
+# ------------------------------------------------------------- downloads ----
+
+download() {
+    local url=$1 dest=$2
+    local part="${dest}.part"
+    run mkdir -p "$(dirname "$dest")"
+    if (( OPT_DRY_RUN )); then hint "[dry-run] download $url"; return 0; fi
+    if have curl; then
+        curl -fL --retry 3 --progress-bar -o "$part" "$url" || { rm -f "$part"; return 1; }
+    elif have wget; then
+        wget -q --show-progress -O "$part" "$url" || { rm -f "$part"; return 1; }
+    else
+        die "Need curl or wget to download $url"
+    fi
+    mv "$part" "$dest"
+}
+
+# Download into a cache and keep it only if the checksum matches.
+fetch_verified() {
+    local url=$1 dest=$2 sha=$3
+    if [[ -f "$dest" ]]; then
+        [[ "$(sha256_of "$dest")" == "$sha" ]] && return 0
+        warn "Checksum mismatch for $(basename "$dest"), downloading again"
+        mv -f "$dest" "${dest}.bad"
+    fi
+    download "$url" "$dest" || return 1
+    (( OPT_DRY_RUN )) && return 0
+    if [[ "$(sha256_of "$dest")" != "$sha" ]]; then
+        mv -f "$dest" "${dest}.bad"
+        warn "Downloaded file has the wrong checksum: $url"
+        return 1
+    fi
+}
+
+winetricks_cache() {
+    if [[ -n "${W_CACHE:-}" ]]; then printf '%s' "$W_CACHE"
+    elif [[ -n "${WINETRICKS_DIR:-}" ]]; then printf '%s/cache' "$WINETRICKS_DIR"
+    else printf '%s/winetricks' "${XDG_CACHE_HOME:-$HOME/.cache}"
+    fi
+}
+
+# ------------------------------------------------------------ fix steps ----
+
+install_facades() {
+    if facades_installed; then ok "WinRT facades already installed"; return 0; fi
+    if ! dotnet48_installed; then
+        bad ".NET Framework 4.8 is not installed in this prefix"
+        hint "Install it first:  WINEPREFIX=\"$PREFIX\" winetricks -q dotnet48"
+        return 1
+    fi
+    have 7z || { bad "7z is needed to unpack the .NET installer"; hint "Install p7zip (Debian/Ubuntu: sudo apt install p7zip-full; Fedora: sudo dnf install p7zip-plugins; Arch: sudo pacman -S 7zip)"; return 1; }
+
+    info "Installing the .NET WinRT facades (needs ~70 MB download, ~350 MB temporary space)"
+    local installer
+    installer="$(winetricks_cache)/dotnet48/${NDP48_NAME}"
+    fetch_verified "$NDP48_URL" "$installer" "$NDP48_SHA256" || { bad "Could not get the .NET 4.8 offline installer"; return 1; }
+    (( OPT_DRY_RUN )) && { hint "[dry-run] would extract facades into the prefix GAC"; return 0; }
+
+    # Work inside the prefix: /tmp may be RAM-backed and the cab is ~350 MB.
+    rm -rf -- "$PREFIX"/.winrt-facades-*
+    local tmp rc=0
+    tmp=$(mktemp -d "$PREFIX/.winrt-facades-XXXXXX") || { bad "Cannot create a temp folder in $PREFIX"; return 1; }
+    extract_facades "$installer" "$tmp" || rc=$?
+    rm -rf -- "$tmp"
+    (( rc == 0 )) && ok "WinRT facades installed into the prefix GAC"
+    return "$rc"
+}
+
+extract_facades() {
+    local installer=$1 tmp=$2 name src target
+    # 7z exits 1 on harmless warnings, so check the extracted files instead.
+    7z e -y -bso0 -bsp0 -o"$tmp" "$installer" "$NDP48_CAB" >/dev/null 2>&1 || true
+    if [[ ! -f "$tmp/$NDP48_CAB" ]]; then
+        bad "Could not unpack $NDP48_CAB from the .NET installer"; return 1
+    fi
+    local -a patterns=()
+    for name in "${FACADES[@]}"; do
+        patterns+=("msil_${name,,}_${FACADE_TOKEN}_*/*")
+    done
+    7z e -y -bso0 -bsp0 -o"$tmp/dll" "$tmp/$NDP48_CAB" "${patterns[@]}" >/dev/null 2>&1 || true
+
+    for name in "${FACADES[@]}"; do
+        src="$tmp/dll/${name,,}.dll"
+        [[ -f "$src" ]] || { bad "${name}.dll not found in the .NET installer"; return 1; }
+        if [[ "$(sha256_of "$src")" != "${FACADE_SHA256[$name]}" ]]; then
+            bad "Unexpected checksum for ${name}.dll; not installing it"; return 1
+        fi
+        target=$(facade_path "$name")
+        if ! { mkdir -p "$(dirname "$target")" && cp -f "$src" "${target}.tmp" && mv -f "${target}.tmp" "$target"; }; then
+            bad "Could not write $target"; return 1
+        fi
+    done
+}
+
+install_winmd() {
+    local support=$1 ver major
+    ver=$(wine_version) || { warn "Wine does not run; skipping WinMetadata"; return 1; }
+    major=${ver%% *}
+
+    if (( major >= 11 )) && ! wine_resolves_winrt; then
+        # This Wine never reads WinMetadata; nothing to install would help.
+        [[ "$support" == supported ]] && ok "This Wine has the login metadata it needs"
+        return 0
+    fi
+    if winmd_present; then ok "WinMetadata already present"; return 0; fi
+
+    info "Installing Windows metadata (WinMetadata)"
+    local cache tmp dest
+    cache="${XDG_CACHE_HOME:-$HOME/.cache}/${APP_ID}/WinMetadata.tar.xz"
+    fetch_verified "$WINMD_URL" "$cache" "$WINMD_SHA256" || { bad "Could not download WinMetadata"; return 1; }
+    (( OPT_DRY_RUN )) && { hint "[dry-run] would extract WinMetadata into $(winmd_dir)"; return 0; }
+
+    tmp=$(mktemp -d) || return 1
+    dest=$(winmd_dir)
+    local rc=0
+    {
+        tar -xJf "$cache" -C "$tmp" && mkdir -p "$dest" &&
+        if (( major >= 11 )); then
+            # Wine 11 builds that resolve namespaces need only the combined
+            # Windows.winmd. Per-namespace files would shadow it and break
+            # opening documents from the command line.
+            cp -f "$tmp/WinMetadata/Windows.winmd" "$dest/Windows.winmd"
+        else
+            cp -f "$tmp"/WinMetadata/*.winmd "$dest/"
+        fi
+    } || rc=1
+    rm -rf -- "$tmp"
+    if (( rc )); then bad "Could not install WinMetadata into $dest"; return 1; fi
+    ok "WinMetadata installed into $dest"
+}
+
+wine_reg_add() {
+    run env WINEPREFIX="$PREFIX" WINEDEBUG=-all "$WINE" reg add "$@" /f >/dev/null 2>&1
+}
+
+fix_registry() {
+    local winexe
+    # Inside the prefix, C:\ maps to drive_c.
+    winexe="C:\\${EXE#"$PREFIX/drive_c/"}"
+    winexe=${winexe//\//\\}
+    # Affinity registers its protocol command one folder too high. Point it at
+    # the real exe so Windows-side handoffs land in the right place too.
+    if wine_reg_add 'HKCU\Software\Classes\affinity\shell\open\command' /ve /d "\"$winexe\" \"%1\""; then
+        ok "Wine's affinity:// command points at $(basename "$EXE")"
+    else
+        warn "Could not update Wine's affinity:// registry entry (not fatal)"
+    fi
+    # WebView2 (Help and some Canva panels) needs Windows 7 mode under Wine.
+    if wine_reg_add 'HKCU\Software\Wine\AppDefaults\msedgewebview2.exe' /v Version /d win7; then
+        ok "WebView2 set to Windows 7 compatibility"
+    fi
+}
+
+# ------------------------------------------------------ desktop handler ----
+
+self_path() { realpath -- "${BASH_SOURCE[0]}"; }
+
+current_default_handler() {
+    if have xdg-mime; then
+        xdg-mime query default "$MIME" 2>/dev/null || true
+        return
+    fi
+    [[ -f "$MIMEAPPS" ]] || return 0
+    awk -v key="$MIME" '
+        /^\[/ { sect = $0; next }
+        sect == "[Default Applications]" {
+            split($0, kv, "="); if (kv[1] == key) { split(kv[2], v, ";"); print v[1]; exit }
+        }' "$MIMEAPPS"
+}
+
+# Set or remove one [Default Applications] entry in mimeapps.list, keeping the
+# rest of the file. Used when xdg-mime is missing, and for uninstall.
+mimeapps_set() {
+    local value=$1   # desktop file name, or empty to remove the key
+    mkdir -p "$(dirname "$MIMEAPPS")"
+    [[ -f "$MIMEAPPS" ]] || : > "$MIMEAPPS"
+    local tmp="${MIMEAPPS}.tmp.$$"
+    awk -v key="$MIME" -v val="$value" '
+        BEGIN { done = 0 }
+        /^\[/ {
+            if (sect == "[Default Applications]" && !done && val != "") { print key "=" val ";"; done = 1 }
+            sect = $0; print; next
+        }
+        sect == "[Default Applications]" && index($0, key "=") == 1 {
+            if (val != "" && !done) { print key "=" val ";"; done = 1 }
+            next
+        }
+        { print }
+        END {
+            if (!done && val != "") {
+                if (sect != "[Default Applications]") print "[Default Applications]"
+                print key "=" val ";"
+            }
+        }' "$MIMEAPPS" > "$tmp"
+    mv "$tmp" "$MIMEAPPS"
+}
+
+# Desktop-entry Exec quoting is fiddly; refuse the few characters that need
+# escaping inside quotes.
+exec_path_ok() { [[ "$1" != *[\"\`\$\\%]* ]]; }
+
+# Quote the path only when the desktop-entry spec requires it: the generic
+# xdg-mime lookup takes the first word of Exec= literally, and skips a handler
+# whose quoted path it can't find.
+exec_path() {
+    if [[ "$1" == *[[:space:]\'\>\<\~\|\&\;\*\?\#\(\)]* ]]; then printf '"%s"' "$1"
+    else printf '%s' "$1"; fi
+}
+
+write_handler() {
+    local current
+    current=$(current_default_handler)
+    if [[ -n "$current" && "$current" != "$HANDLER_DESKTOP" && "$current" != "$WINE_GENERATED_HANDLER" ]] && (( ! OPT_FORCE )); then
+        warn "affinity:// links are handled by '$current' (another setup)."
+        hint "Leaving it alone. Re-run with --force to make this connector the handler."
+        return 1
+    fi
+
+    local file="$APPS_DIR/$HANDLER_DESKTOP" script
+    script=$(self_path)
+    exec_path_ok "$script" || die "Unsupported character in path: $script (install with ./install.sh to ~/.local/bin)"
+    run mkdir -p "$APPS_DIR"
+    if (( OPT_DRY_RUN )); then
+        hint "[dry-run] would write $file"
+    else
+        cat > "$file" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Affinity Canva sign-in
+Comment=Hands Canva sign-in links back to Affinity running under Wine
+Exec=$(exec_path "$script") handle %u
+MimeType=${MIME};
+NoDisplay=true
+Terminal=false
+X-${APP_ID}-Prefix=${PREFIX}
+EOF
+    fi
+    if have update-desktop-database; then
+        run update-desktop-database "$APPS_DIR" >/dev/null 2>&1 || true
+    fi
+
+    if have xdg-mime && run xdg-mime default "$HANDLER_DESKTOP" "$MIME" 2>/dev/null; then :
+    else
+        (( OPT_DRY_RUN )) || mimeapps_set "$HANDLER_DESKTOP"
+    fi
+
+    # Wine regenerates its own handler, which runs `wine start` and crashes on
+    # long links. Park it so it can't win the default again.
+    if [[ -f "$APPS_DIR/$WINE_GENERATED_HANDLER" ]]; then
+        run mkdir -p "$STATE_DIR"
+        run mv -f "$APPS_DIR/$WINE_GENERATED_HANDLER" "$STATE_DIR/${WINE_GENERATED_HANDLER}.bak"
+    fi
+    ok "affinity:// links now open through this connector"
+}
+
+# -------------------------------------------------------------- commands ----
+
+cmd_setup() {
+    resolve_targets 1
+    info "Affinity prefix: $PREFIX"
+    info "Wine:            $WINE"
+    info "Launch target:   $EXE"
+    save_config
+
+    local support reason failed=0
+    { read -r support; read -r reason; } < <(signin_support; echo)
+
+    if (( ! OPT_SKIP_FACADES )); then install_facades || failed=1; fi
+    if (( ! OPT_SKIP_WINMD )); then install_winmd "$support" || failed=1; fi
+    if (( ! OPT_SKIP_REGISTRY )); then fix_registry; fi
+
+    # Re-check: installing metadata can change the verdict.
+    { read -r support; read -r reason; } < <(signin_support; echo)
+    if [[ "$support" != supported ]]; then
+        bad "Canva sign-in callback is not supported here: $reason"
+        explain_unsupported
+        if (( ! OPT_FORCE )); then
+            hint "Not registering the affinity:// handler, because forwarding the link would crash a running Affinity. Use --force to register it anyway."
+            return 1
+        fi
+        warn "--force given: registering the handler anyway"
+    elif ! facades_installed && (( ! OPT_FORCE && ! OPT_DRY_RUN )); then
+        bad "WinRT facades are missing, so not registering the handler (a running Affinity would crash). Use --force to override."
+        return 1
+    else
+        ok "Sign-in callback supported ($reason)"
+    fi
+
+    write_handler || failed=1
+    echo
+    if (( failed )); then
+        warn "Setup finished with problems. Run 'canva-affinity doctor' for details."
+        return 1
+    fi
+    ok "Done. Restart Affinity, choose Sign in, and finish signing in to Canva in your browser."
+    hint "If the browser asks to open the link, allow it. If nothing happens, run: canva-affinity paste"
+}
+
+explain_unsupported() {
+    hint "Options:"
+    hint " - Use an Affinity-patched Wine 11.18+ (Linux-Affinity-Installer ships 11.20/11.21),"
+    hint "   or ElementalWarrior Wine 10.10, then run 'canva-affinity setup' again."
+    hint " - Or install the LoginFix plugin (AffinityPluginLoader), which works around the crash."
+}
+
+cmd_doctor() {
+    resolve_targets 0
+    local problems=0 ver support reason current
+    echo "canva-affinity ${VERSION} — sign-in check"
+    echo
+    ok "Affinity found: $(affinity_dir "$PREFIX")"
+    hint "launch target: $EXE"
+
+    if ver=$(wine_version); then ok "Wine ${ver/ /.}: $WINE"
+    else bad "Wine not runnable: ${WINE:-not found}"; hint "Set it with: canva-affinity setup --wine /path/to/bin/wine"; problems=1; fi
+
+    if dotnet48_installed; then ok ".NET Framework 4.8 installed"
+    else bad ".NET Framework 4.8 missing"; hint "WINEPREFIX=\"$PREFIX\" winetricks -q dotnet48"; problems=1; fi
+
+    if facades_installed; then ok "WinRT facades installed"
+    else bad "WinRT facades missing (Affinity can't read the sign-in link)"; hint "Fix: canva-affinity setup"; problems=1; fi
+
+    if winmd_present; then ok "WinMetadata present: $(winmd_dir)"
+    else warn "No WinMetadata in the prefix"; fi
+
+    { read -r support; read -r reason; } < <(signin_support; echo)
+    case "$support" in
+        supported) ok "Wine can complete the sign-in callback ($reason)" ;;
+        *) bad "Sign-in callback: $support ($reason)"; explain_unsupported; problems=1 ;;
+    esac
+
+    current=$(current_default_handler)
+    if [[ "$current" == "$HANDLER_DESKTOP" && -f "$APPS_DIR/$HANDLER_DESKTOP" ]]; then
+        ok "affinity:// links are handled by this connector"
+    elif [[ -z "$current" ]]; then
+        bad "No handler for affinity:// links"; hint "Fix: canva-affinity setup"; problems=1
+    elif [[ "$current" == "$WINE_GENERATED_HANDLER" ]]; then
+        bad "affinity:// goes to Wine's generic handler, which crashes on sign-in links"; hint "Fix: canva-affinity setup"; problems=1
+    else
+        warn "affinity:// links are handled by '$current' (another setup)"
+        hint "That may work. To use this connector instead: canva-affinity setup --force"
+    fi
+
+    if [[ -f "$(affinity_dir "$PREFIX")/AffinityHook.exe" ]]; then
+        hint "AffinityPluginLoader detected (plugins load on cold start)."
+    fi
+    echo
+    if (( problems )); then
+        warn "Some checks failed. 'canva-affinity setup' fixes most of them."
+        return 1
+    fi
+    ok "Everything needed for Canva sign-in is in place."
+    hint "AI tools (Generative Fill, Remove Background, Expand, …) need a Canva plan that includes them."
+}
+
+# Environment for Wine: the prefix plus WINE_ENV's NAME=value words.
+build_env() {
+    local -n _out=$1
+    local -a words=()
+    local w
+    _out=("WINEPREFIX=$PREFIX")
+    read -r -a words <<< "$WINE_ENV" || true
+    for w in "${words[@]}"; do
+        if [[ "$w" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then _out+=("$w")
+        else warn "Ignoring WINE_ENV entry '$w' (expected NAME=value)"; fi
+    done
+}
+
+# Keep the auth code out of logs: show scheme, host and path only.
+redact_url() {
+    local url=$1 base=${1%%[?#]*}
+    if [[ "$base" != "$url" ]]; then printf '%s?<%d chars hidden>' "$base" "$(( ${#url} - ${#base} ))"
+    else printf '%s' "$base"; fi
+}
+
+cmd_handle() {
+    local url=${1:-}
+    HANDLE_MODE=1
+    [[ -n "$url" ]] || die "Usage: canva-affinity handle 'affinity://…'"
+    # Only ever forward affinity:// links, passed as one argument (never via a shell).
+    [[ "${url,,}" == "${SCHEME}://"* ]] || die "Not an affinity:// link"
+    [[ "$url" != *$'\n'* && "$url" != *$'\r'* ]] || die "Link contains line breaks"
+    (( ${#url} <= 32768 )) || die "Link is too long"
+
+    resolve_targets 1
+    mkdir -p "$STATE_DIR"
+    printf '%s handle %s (%d chars) -> %s\n' "$(date '+%F %T')" "$(redact_url "$url")" "${#url}" "$EXE" >> "$LOG_FILE"
+
+    local -a env_args=()
+    build_env env_args
+    [[ -n "${WINEDEBUG:-}" ]] || env_args+=("WINEDEBUG=-all")
+
+    if (( OPT_DRY_RUN )); then
+        printf '[dry-run] env %s %q %q <link>\n' "${env_args[*]}" "$WINE" "$EXE"
+        return 0
+    fi
+    if (( OPT_FOREGROUND )); then
+        exec env "${env_args[@]}" "$WINE" "$EXE" "$url"
+    fi
+    # Detach so the browser isn't left waiting. If Affinity is already running,
+    # this second instance forwards the link to it and exits.
+    if have setsid; then
+        setsid env "${env_args[@]}" "$WINE" "$EXE" "$url" >>"$LOG_FILE" 2>&1 < /dev/null &
+    else
+        nohup env "${env_args[@]}" "$WINE" "$EXE" "$url" >>"$LOG_FILE" 2>&1 < /dev/null &
+    fi
+    disown || true
+}
+
+cmd_paste() {
+    cat <<'EOF'
+Manual sign-in fallback.
+ 1. In Affinity, choose Sign in and finish signing in to Canva in your browser.
+ 2. When the browser shows "Open Affinity?" (or nothing happens), copy the
+    affinity:// link it tried to open (right-click the button > Copy link,
+    or copy it from the address bar).
+ 3. Paste it below and press Enter. It is not shown or saved.
+EOF
+    local url
+    read -rs -p "affinity:// link: " url || true
+    echo
+    url=${url#"${url%%[![:space:]]*}"}; url=${url%"${url##*[![:space:]]}"}
+    [[ "${url,,}" == "${SCHEME}://"* ]] || die "That doesn't look like an affinity:// link"
+    cmd_handle "$url"
+    ok "Link sent to Affinity. Check the Affinity window."
+}
+
+cmd_launch() {
+    resolve_targets 1
+    local -a env_args=()
+    build_env env_args
+    run exec env "${env_args[@]}" "$WINE" "$EXE" "$@"
+}
+
+cmd_uninstall() {
+    local file="$APPS_DIR/$HANDLER_DESKTOP" current
+    current=$(current_default_handler)
+    if [[ -f "$file" ]]; then run rm -f "$file"; ok "Removed $file"; fi
+    if [[ "$current" == "$HANDLER_DESKTOP" ]]; then
+        (( OPT_DRY_RUN )) || mimeapps_set ""
+        ok "Removed the affinity:// default"
+    fi
+    if have update-desktop-database; then
+        run update-desktop-database "$APPS_DIR" >/dev/null 2>&1 || true
+    fi
+    if (( OPT_PURGE )); then
+        run rm -rf "$CONFIG_DIR" "$STATE_DIR"
+        ok "Removed config and logs"
+    fi
+    hint "Files added inside the Wine prefix (WinRT facades, WinMetadata) were left in place; they are harmless."
+}
+
+usage() {
+    cat <<EOF
+canva-affinity ${VERSION} — use your Canva plan's AI tools in Affinity on Linux
+
+Usage: canva-affinity <command> [options]
+
+Commands:
+  setup       Fix the Canva sign-in for your Affinity Wine install (run once)
+  doctor      Check every piece the sign-in needs and say what's missing
+  paste       Manual fallback: paste the affinity:// link from your browser
+  launch      Start Affinity with the configured Wine
+  handle URL  (used by the browser) pass an affinity:// link to Affinity
+  uninstall   Remove the link handler (add --purge to drop config and logs)
+  version     Print the version
+
+Options:
+  --prefix DIR    Wine prefix that has Affinity (default: auto-detect)
+  --wine PATH     Wine binary to use (default: the prefix's bundled Wine, else system wine)
+  --exe PATH      Affinity executable to launch (default: AffinityHook.exe or Affinity.exe)
+  --force         Replace another affinity:// handler / register on unsupported Wine
+  --no-facades    setup: skip installing the .NET WinRT facades
+  --no-winmd      setup: skip installing WinMetadata
+  --no-registry   setup: skip the Wine registry tweaks
+  --foreground    handle: run Wine in the foreground (for debugging)
+  --dry-run       Show what would change without changing anything
+  -h, --help      Show this help
+
+Config: $CONFIG_FILE
+Log:    $LOG_FILE
+EOF
+}
+
+main() {
+    local cmd=${1:-help}
+    (( $# )) && shift
+    local -a args=()
+    while (( $# )); do
+        case "$1" in
+            --prefix)      OPT_PREFIX=${2:?--prefix needs a value}; shift ;;
+            --prefix=*)    OPT_PREFIX=${1#*=} ;;
+            --wine)        OPT_WINE=${2:?--wine needs a value}; shift ;;
+            --wine=*)      OPT_WINE=${1#*=} ;;
+            --exe)         OPT_EXE=${2:?--exe needs a value}; shift ;;
+            --exe=*)       OPT_EXE=${1#*=} ;;
+            --force)       OPT_FORCE=1 ;;
+            --yes|-y)      OPT_YES=1 ;;
+            --no-facades)  OPT_SKIP_FACADES=1 ;;
+            --no-winmd)    OPT_SKIP_WINMD=1 ;;
+            --no-registry) OPT_SKIP_REGISTRY=1 ;;
+            --foreground)  OPT_FOREGROUND=1 ;;
+            --purge)       OPT_PURGE=1 ;;
+            --dry-run|-n)  OPT_DRY_RUN=1 ;;
+            -h|--help)     usage; exit 0 ;;
+            --)            shift; args+=("$@"); break ;;
+            -*)            die "Unknown option: $1 (see canva-affinity help)" ;;
+            *)             args+=("$1") ;;
+        esac
+        shift
+    done
+    : "$OPT_YES"  # reserved for future prompts
+
+    case "$cmd" in
+        setup|install)  cmd_setup ;;
+        doctor|status|check) cmd_doctor ;;
+        handle)         cmd_handle "${args[0]:-}" ;;
+        paste)          cmd_paste ;;
+        launch|run)     cmd_launch "${args[@]}" ;;
+        uninstall)      cmd_uninstall ;;
+        version|--version|-V) echo "canva-affinity ${VERSION}" ;;
+        help|-h|--help) usage ;;
+        *)              die "Unknown command: $cmd (see canva-affinity help)" ;;
+    esac
+}
+
+# Allow tests to source this file without running main.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
