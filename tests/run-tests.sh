@@ -44,6 +44,8 @@ make_prefix() {
 if [[ "${1:-}" == --version ]]; then echo "wine-${FAKE_WINE_VERSION}"; exit 0; fi
 if [[ "${1:-}" == reg ]]; then printf '%s\n' "$*" >> "$FAKE_LOG"; exit 0; fi
 { printf 'WINEPREFIX=%s\0' "${WINEPREFIX:-}"; printf 'EXTRA=%s\0' "${FAKE_EXTRA:-}"; printf '%s\0' "$@"; } > "$FAKE_ARGS"
+# Like some real launchers, optionally echo the whole command line (link included).
+if [[ -n "${FAKE_ECHO:-}" ]]; then echo "invoked: ${*: -1}"; echo "NOTE: No such file: ${*: -1}" >&2; fi
 EOF
     chmod +x "$p/ElementalWarriorWine/bin/wine"
 }
@@ -223,6 +225,72 @@ test_browser_handoff_via_xdg_open() {
     read_args
     assert_eq "${ARGS[3]:-}" "$url"
     assert_not_contains "$(cat "$XDG_STATE_HOME/canva-affinity-connector/handler.log")" "TOPSECRET"
+}
+
+test_handle_keeps_secrets_out_of_logs() {
+    # Wine/Affinity may echo the whole link; neither log may contain its secrets.
+    offline_setup >/dev/null 2>&1
+    export FAKE_ECHO=1
+    url="affinity://canva/authorize?code=eyJSECRETJWT.part2-x_y&exchangeId=EXCHSECRET"
+    "$CLI" handle "$url" || fail "handle failed"
+    local state="$XDG_STATE_HOME/canva-affinity-connector"
+    for _ in $(seq 50); do grep -q 'No such file' "$state/wine.log" 2>/dev/null && break; sleep 0.1; done
+    wine_log=$(cat "$state/wine.log")
+    assert_contains "$wine_log" "invoked: affinity://canva/authorize?<hidden>"
+    assert_contains "$wine_log" "No such file: affinity://canva/authorize?<hidden>"
+    for f in "$state/wine.log" "$state/handler.log"; do
+        assert_not_contains "$(cat "$f")" "eyJSECRETJWT"
+        assert_not_contains "$(cat "$f")" "EXCHSECRET"
+    done
+    # handler.log stays one line per link, with no Wine output in it.
+    assert_eq "$(wc -l < "$state/handler.log")" "1"
+}
+
+test_redact_stream() {
+    # shellcheck source=bin/canva-affinity
+    source "$CLI"
+    assert_eq "$(echo 'open AFFINITY://a/b#frag=1 now' | redact_stream)" "open AFFINITY://a/b?<hidden> now"
+    assert_eq "$(echo 'GET /cb?code=abc.def&state=xyz&lang=en' | redact_stream)" "GET /cb?code=<hidden>&state=<hidden>&lang=en"
+    assert_eq "$(echo 'plain text' | redact_stream)" "plain text"
+}
+
+test_setup_rejects_file_only_launcher() {
+    local dir="$PFX/drive_c/Program Files/Affinity/Affinity"
+    : > "$dir/affinity-on-linux.exe"
+    seed_facades; seed_winmd
+    if out=$("$CLI" setup --exe "$dir/affinity-on-linux.exe" 2>&1); then fail "setup should refuse a file-only launcher"; fi
+    assert_contains "$out" "can't take sign-in links"
+    assert_no_file "$XDG_DATA_HOME/applications/canva-affinity-handler.desktop"
+}
+
+test_config_file_only_launcher_falls_back() {
+    # Configs written by 1.0.0 may point at a file-only launcher.
+    local dir="$PFX/drive_c/Program Files/Affinity/Affinity"
+    : > "$dir/affinity-on-linux.exe"
+    offline_setup >/dev/null 2>&1
+    local cfg="$XDG_CONFIG_HOME/canva-affinity-connector/config"
+    sed -i "s|^EXE=.*|EXE=\"$dir/affinity-on-linux.exe\"|" "$cfg"
+    "$CLI" handle --foreground "affinity://x" 2>/dev/null || fail "handle failed"
+    read_args
+    assert_eq "${ARGS[2]}" "$dir/Affinity.exe"
+    assert_contains "$(cat "$XDG_STATE_HOME/canva-affinity-connector/handler.log")" "cannot take links"
+    # Re-running setup rewrites the config.
+    "$CLI" setup >/dev/null 2>&1 || fail "setup failed"
+    assert_contains "$(cat "$cfg")" "EXE=\"$dir/Affinity.exe\""
+}
+
+test_doctor_flags_installer_handler() {
+    # Linux-Affinity-Installer's handler passes links to affinity-on-linux.exe.
+    local apps="$XDG_DATA_HOME/applications"
+    printf '[Desktop Entry]\nType=Application\nName=Affinity sign-in handler\nExec=env WINEPREFIX=x wine "C:/Affinity/affinity-on-linux.exe" %%F %%u\nMimeType=x-scheme-handler/affinity;\n' > "$apps/affinity-url-handler.desktop"
+    xdg-mime default affinity-url-handler.desktop x-scheme-handler/affinity
+    if out=$(offline_setup 2>&1); then fail "setup should not take over without --force"; fi
+    assert_contains "$out" "treats it as a file name"
+    if out=$("$CLI" doctor 2>&1); then fail "doctor should flag the installer's handler"; fi
+    assert_contains "$out" "passes them to a launcher that treats them as file names"
+    assert_contains "$out" "setup --force"
+    "$CLI" setup --force >/dev/null 2>&1 || fail "--force setup failed"
+    out=$("$CLI" doctor 2>&1) || fail "doctor should pass after --force: $out"
 }
 
 test_handle_rejects_other_schemes() {
