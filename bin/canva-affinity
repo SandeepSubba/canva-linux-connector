@@ -20,13 +20,17 @@
 set -o errexit -o nounset -o pipefail
 shopt -s nullglob
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.1.0"
 readonly APP_ID="canva-affinity-connector"
 readonly HANDLER_DESKTOP="canva-affinity-handler.desktop"
 readonly SCHEME="affinity"
 readonly MIME="x-scheme-handler/${SCHEME}"
 # Handlers we may replace without --force: none, ours, and Wine's generated one.
 readonly WINE_GENERATED_HANDLER="wine-protocol-affinity.desktop"
+# Launchers that open documents but can't take an affinity:// link: they treat
+# the link as a file name ("No such file"), so the sign-in never reaches
+# Affinity. Linux-Affinity-Installer's launcher is one of them.
+readonly -a FILE_ONLY_LAUNCHERS=("affinity-on-linux.exe")
 
 # .NET Framework 4.8 offline installer (the same file winetricks dotnet48 uses).
 readonly NDP48_NAME="ndp48-x86-x64-allos-enu.exe"
@@ -66,6 +70,9 @@ readonly CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/${APP_ID}"
 readonly CONFIG_FILE="${CONFIG_DIR}/config"
 readonly STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/${APP_ID}"
 readonly LOG_FILE="${STATE_DIR}/handler.log"
+# Output from Wine and Affinity, with link secrets hidden. Kept apart from
+# handler.log so that log stays one short line per link.
+readonly WINE_LOG_FILE="${STATE_DIR}/wine.log"
 readonly APPS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 readonly MIMEAPPS="${XDG_CONFIG_HOME:-$HOME/.config}/mimeapps.list"
 
@@ -220,6 +227,37 @@ detect_exe() {
     fi
 }
 
+# True for launchers that can't take a sign-in link (see FILE_ONLY_LAUNCHERS).
+is_file_only_launcher() {
+    local name l
+    name=$(basename -- "$1")
+    name=${name,,}
+    for l in "${FILE_ONLY_LAUNCHERS[@]}"; do
+        [[ "$name" == "$l" ]] && return 0
+    done
+    return 1
+}
+
+# Refuse a launcher that can't take links. A bad --exe is an error; a bad value
+# from the config file (older versions accepted it) falls back to detection.
+check_exe() {
+    is_file_only_launcher "$EXE" || return 0
+    local name
+    name=$(basename -- "$EXE")
+    if [[ -n "$OPT_EXE" ]]; then
+        die "$name can't take sign-in links: it treats the link as a file name, so Affinity never gets it.
+       Leave out --exe, or point it at Affinity.exe (or AffinityHook.exe)."
+    fi
+    EXE=$(detect_exe "$PREFIX")
+    warn "Config points at $name, which can't take sign-in links. Using $(basename -- "$EXE") instead."
+    hint "Run 'canva-affinity setup' to update the config."
+    if (( HANDLE_MODE )); then
+        mkdir -p "$STATE_DIR" 2>/dev/null &&
+            printf '%s note: config EXE %s cannot take links; using %s\n' "$(date '+%F %T')" "$name" "$(basename -- "$EXE")" >> "$LOG_FILE"
+    fi
+    return 0
+}
+
 # Fill PREFIX / WINE / EXE from flags, the config file and detection.
 resolve_targets() {
     local need_wine=${1:-1}
@@ -238,6 +276,7 @@ resolve_targets() {
        Expected: $(affinity_dir "$PREFIX")/Affinity.exe"
 
     [[ -n "$EXE" ]] || EXE=$(detect_exe "$PREFIX")
+    check_exe
     [[ -f "$EXE" ]] || die "Affinity executable not found: $EXE"
 
     if [[ -z "$WINE" ]]; then
@@ -508,6 +547,19 @@ current_default_handler() {
         }' "$MIMEAPPS"
 }
 
+# True when another app's handler passes links to a launcher that can't take
+# them, such as Linux-Affinity-Installer's affinity-url-handler.desktop.
+handler_uses_file_only_launcher() {
+    local file="$APPS_DIR/$1" exec_line l
+    [[ -f "$file" ]] || return 1
+    exec_line=$(sed -n 's/^Exec=//p' "$file" | head -n1)
+    exec_line=${exec_line,,}
+    for l in "${FILE_ONLY_LAUNCHERS[@]}"; do
+        [[ "$exec_line" == *"$l"* ]] && return 0
+    done
+    return 1
+}
+
 # Set or remove one [Default Applications] entry in mimeapps.list, keeping the
 # rest of the file. Used when xdg-mime is missing, and for uninstall.
 mimeapps_set() {
@@ -552,6 +604,10 @@ write_handler() {
     current=$(current_default_handler)
     if [[ -n "$current" && "$current" != "$HANDLER_DESKTOP" && "$current" != "$WINE_GENERATED_HANDLER" ]] && (( ! OPT_FORCE )); then
         warn "affinity:// links are handled by '$current' (another setup)."
+        if handler_uses_file_only_launcher "$current"; then
+            hint "That handler passes the link to a launcher that treats it as a file name,"
+            hint "so the sign-in never reaches Affinity."
+        fi
         hint "Leaving it alone. Re-run with --force to make this connector the handler."
         return 1
     fi
@@ -676,6 +732,9 @@ cmd_doctor() {
         bad "No handler for affinity:// links"; hint "Fix: canva-affinity setup"; problems=1
     elif [[ "$current" == "$WINE_GENERATED_HANDLER" ]]; then
         bad "affinity:// goes to Wine's generic handler, which crashes on sign-in links"; hint "Fix: canva-affinity setup"; problems=1
+    elif handler_uses_file_only_launcher "$current"; then
+        bad "affinity:// links go to '$current', which passes them to a launcher that treats them as file names"
+        hint "Sign-in won't reach Affinity. Fix: canva-affinity setup --force"; problems=1
     else
         warn "affinity:// links are handled by '$current' (another setup)"
         hint "That may work. To use this connector instead: canva-affinity setup --force"
@@ -713,6 +772,15 @@ redact_url() {
     else printf '%s' "$base"; fi
 }
 
+# Same idea for free text such as Wine's output, which can echo the whole link:
+# hide everything after ? or # in affinity:// links, and the value of any
+# code=, token=, state= or exchangeId= parameter.
+redact_stream() {
+    LC_ALL=C sed -E \
+        -e 's#([Aa][Ff][Ff][Ii][Nn][Ii][Tt][Yy]://[^?#[:space:]"'\'']*)[?#][^[:space:]"'\'']*#\1?<hidden>#g' \
+        -e 's#((code|token|access_token|id_token|state|exchangeId)=)[^&[:space:]"'\'']+#\1<hidden>#g'
+}
+
 cmd_handle() {
     local url=${1:-}
     HANDLE_MODE=1
@@ -739,11 +807,15 @@ cmd_handle() {
     fi
     # Detach so the browser isn't left waiting. If Affinity is already running,
     # this second instance forwards the link to it and exits.
-    if have setsid; then
-        setsid env "${env_args[@]}" "$WINE" "$EXE" "$url" >>"$LOG_FILE" 2>&1 < /dev/null &
-    else
-        nohup env "${env_args[@]}" "$WINE" "$EXE" "$url" >>"$LOG_FILE" 2>&1 < /dev/null &
-    fi
+    # Wine and Affinity may print the whole link (with its one-time code), so
+    # their output goes through redact_stream into wine.log, never handler.log.
+    local -a detach=()
+    if have setsid; then detach=(setsid); else detach=(nohup); fi
+    printf '%s --- handle %s\n' "$(date '+%F %T')" "$(redact_url "$url")" >> "$WINE_LOG_FILE"
+    {
+        "${detach[@]}" env "${env_args[@]}" "$WINE" "$EXE" "$url" 2>&1 < /dev/null |
+            redact_stream >> "$WINE_LOG_FILE"
+    } >/dev/null 2>&1 &
     disown || true
 }
 
@@ -817,8 +889,9 @@ Options:
   --dry-run       Show what would change without changing anything
   -h, --help      Show this help
 
-Config: $CONFIG_FILE
-Log:    $LOG_FILE
+Config:   $CONFIG_FILE
+Log:      $LOG_FILE
+Wine log: $WINE_LOG_FILE (link secrets hidden)
 EOF
 }
 
